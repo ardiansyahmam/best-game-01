@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <title>Gloamguard — best-game-01</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Ccircle%20cx='16'%20cy='16'%20r='13'%20fill='%23ffc861'/%3E%3Ccircle%20cx='16'%20cy='16'%20r='6'%20fill='%23ff8c1a'/%3E%3C/svg%3E">
 <meta name="viewport" content="width=1280">
 <style>
   html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #171310; }
@@ -45,6 +46,16 @@
   .screen .keys { font-size: 17px; color: #d8b36a; line-height: 1.8; }
   .screen .cta { font-size: 26px; color: #ffd98a; margin-top: 18px; animation: pulse 1.4s ease-in-out infinite; text-shadow: 0 2px 10px #000; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
+  .screen p.lose { color: #ff9a8a; font-size: 19px; margin-top: 4px; }
+  .screen p.tips { color: #ffd98a; font-size: 19px; margin-top: 2px; }
+  /* core-charge flash (Jin polish): big red pulse on every CORE -1 */
+  #coreflash { position: fixed; left: 0; right: 0; top: 24%; text-align: center; font-size: 46px; font-weight: bold; letter-spacing: 4px; color: #ff5a4a; text-shadow: 0 0 18px rgba(255,40,20,.9), 0 2px 8px #000; pointer-events: none; opacity: 0; z-index: 5; font-family: Georgia, 'Times New Roman', serif; }
+  #coreflash.show { animation: corepulse 0.3s ease-out forwards; }
+  #coreflash.show.long { animation-duration: 1.4s; }
+  @keyframes corepulse { 0% { opacity: 0; transform: scale(1.5); } 20% { opacity: 1; transform: scale(1.05); } 70% { opacity: 1; transform: scale(1); } 100% { opacity: 0; transform: scale(1); } }
+  /* last-charge warning: the PRISM CORE panel pulses red while 1 charge is left */
+  #corepanel.critical { border-color: #ff4a3a; animation: corewarn 0.7s ease-in-out infinite; }
+  @keyframes corewarn { 0%,100% { background: rgba(12,9,7,0.62); box-shadow: none; } 50% { background: rgba(255,42,20,0.45); box-shadow: 0 0 18px rgba(255,60,30,.8); } }
   /* deterministic captures: freeze the pulsing CTA (its opacity is wall-clock) */
   .shot .cta { animation: none !important; opacity: 1; }
   .btn { pointer-events: auto; cursor: pointer; font-family: Georgia, serif; font-size: 24px; letter-spacing: 2px; color: #1a1208; background: linear-gradient(180deg, #ffd98a, #e09a2b); border: 2px solid #7a5a1a; border-radius: 12px; padding: 12px 34px; margin-top: 20px; box-shadow: 0 6px 24px rgba(0,0,0,.6); }
@@ -80,7 +91,7 @@
       <div id="hpbar"><div id="hpfill"></div></div>
       <div class="big"><span id="hptext">100</span> / 100</div>
     </div>
-    <div class="panel" style="text-align:center">
+    <div class="panel" id="corepanel" style="text-align:center">
       <div class="lbl">PRISM CORE</div>
       <div id="core">◆◆◆◆◆</div>
     </div>
@@ -104,6 +115,7 @@
   </div>
 </div>
 <div id="banner" class="layer hidden"><h2 id="banner-title">WAVE 1</h2><p id="banner-sub"></p></div>
+<div id="coreflash"></div>
 <div id="dmg" class="layer hidden"></div>
 
 <!-- Title -->
@@ -114,6 +126,8 @@
      slow down and take extra damage inside the light — trap them there.
      Anything that reaches the tower drains one charge of its core. Survive
      5 waves and slay the Furnace Maw.</p>
+  <p class="lose">You lose if the Guardian's HP hits zero — or if the prism core loses all 5 of its charges.</p>
+  <p class="tips">☀ Steer a beam onto enemies to slow them &nbsp;·&nbsp; Hold CLICK to fire Sunspikes</p>
   <p class="keys">WASD — move &nbsp;·&nbsp; Mouse — aim &nbsp;·&nbsp; Click — Sunspike<br>
      Space — dash &nbsp;·&nbsp; Q — turn the beacon 60° &nbsp;·&nbsp; Esc — pause</p>
   <div class="cta">Click or press ENTER to begin</div>
@@ -130,6 +144,7 @@
 <div id="pause" class="screen hidden">
   <h1 style="font-size:64px">PAUSED</h1>
   <p>Press Esc to resume · R to restart</p>
+  <button class="btn" id="shake-btn" style="font-size:18px; padding:8px 22px">Camera shake: ON</button>
 </div>
 
 <!-- End -->

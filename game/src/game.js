@@ -64,6 +64,7 @@ const el = {
   dmg: $('dmg'), title: $('title'), upgrade: $('upgrade'), upgTimer: $('upgtimer'),
   cards: $('cards'), pause: $('pause'), endcard: $('endcard'), endTitle: $('end-title'),
   endSub: $('end-sub'), endScore: $('end-score'), endWave: $('end-wave'), endBest: $('end-best'),
+  coreFlash: $('coreflash'), corePanel: $('corepanel'), shakeBtn: $('shake-btn'),
 };
 
 // ---------- state ----------
@@ -76,6 +77,7 @@ const G = {
   enemies: [], bolts: [], ebolts: [], particles: [], dmgNums: [], pickups: [],
   boss: null, bossAddsTimer: 0, bossMotifTimer: 0, bossSlam: null, bossCharge: null,
   upgradeChoices: [], upgradeTimer: 0, bannerTimer: 0,
+  shakeOn: true, // camera-shake toggle (pause menu); persisted in localStorage
   upg: { twin: 0, lens: 0, heart: 0, quick: 0, ember: 0 },
   pausedFrom: null,
 };
@@ -83,6 +85,7 @@ const player = {
   pos: new THREE.Vector3(0, 0, 6), vel: new THREE.Vector3(), aim: new THREE.Vector3(0, 0, -1),
   hp: 100, hpMax: 100, speed: 7, fireCd: 0, dashCd: 0, dashTime: 0, dashDir: new THREE.Vector3(),
   invuln: 0, moving: false, mixer: null, obj: null, radius: 0.7,
+  flinchT: 0, flinchDir: new THREE.Vector3(0, 0, 1), // hit reaction (user feedback)
 };
 const keys = {};
 let mouseNDC = new THREE.Vector2(0, 0);
@@ -310,6 +313,14 @@ function normalizeModel(obj, targetHeight) {
 function makeCharacter(type) {
   const t = templates[type];
   const obj = cloneSkinned(t.scene);
+  // Clone materials per instance: SkeletonUtils.clone shares the template's
+  // materials, so a hit-flash (emissive) on one enemy would otherwise flash
+  // every enemy of that type at once.
+  obj.traverse((n) => {
+    if (n.isMesh && n.material) {
+      n.material = Array.isArray(n.material) ? n.material.map((m) => m.clone()) : n.material.clone();
+    }
+  });
   normalizeModel(obj, ENEMY_DEF[type === 'knight' ? 'stalker' : type].height || 1.85);
   const mixer = new THREE.AnimationMixer(obj);
   mixers.push(mixer);
@@ -337,6 +348,55 @@ function blobShadow(obj, radius) {
   m.rotation.x = -Math.PI / 2; m.position.y = 0.02;
   obj.add(m);
   return m;
+}
+
+// ---------- "SLOWED" mark for enemies caught in a beam (Jin polish) ----------
+// One shared canvas texture (procedural sun + SLOWED text) and one shared gold
+// ring; each enemy gets its own sprite + ring mesh, shown only while lit.
+function makeSlowMarkTexture() {
+  const c = document.createElement('canvas');
+  c.width = 340; c.height = 72;
+  const g = c.getContext('2d');
+  g.fillStyle = '#ffd98a'; g.strokeStyle = '#ffd98a'; g.lineWidth = 5;
+  g.beginPath(); g.arc(34, 36, 15, 0, Math.PI * 2); g.fill();
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2;
+    g.beginPath();
+    g.moveTo(34 + Math.cos(a) * 21, 36 + Math.sin(a) * 21);
+    g.lineTo(34 + Math.cos(a) * 29, 36 + Math.sin(a) * 29);
+    g.stroke();
+  }
+  g.font = 'bold 40px Georgia, "Times New Roman", serif';
+  g.textBaseline = 'middle';
+  g.lineWidth = 6; g.strokeStyle = 'rgba(0,0,0,0.85)';
+  g.strokeText('SLOWED', 66, 38);
+  g.fillStyle = '#ffe9b0';
+  g.fillText('SLOWED', 66, 38);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+const slowMarkMat = new THREE.SpriteMaterial({ map: makeSlowMarkTexture(), transparent: true, depthWrite: false });
+const slowRingGeo = new THREE.RingGeometry(0.92, 1.12, 32);
+const slowRingMat = new THREE.MeshBasicMaterial({ color: 0xffc861, transparent: true, opacity: 0.85, side: THREE.DoubleSide, depthWrite: false });
+function attachSlowMark(e) {
+  const mark = new THREE.Sprite(slowMarkMat);
+  mark.scale.set(3.0, 0.64, 1);
+  mark.position.y = e.def.height + 0.8;
+  mark.visible = false;
+  e.obj.add(mark);
+  const ring = new THREE.Mesh(slowRingGeo, slowRingMat);
+  ring.rotation.x = -Math.PI / 2;
+  ring.position.y = 0.05;
+  ring.scale.setScalar(e.def.radius + 0.3);
+  ring.visible = false;
+  e.obj.add(ring);
+  e.slowMark = mark;
+  e.slowRing = ring;
+}
+function setSlowMark(e, lit) {
+  if (e.slowMark) e.slowMark.visible = lit;
+  if (e.slowRing) e.slowRing.visible = lit;
 }
 
 // ---------- projectiles / particles / pickups ----------
@@ -416,6 +476,8 @@ function showDmgNum(worldPos, text, cls = '', size = 20) {
   slot.el.style.display = 'block';
 }
 const _v = new THREE.Vector3();
+const _punchAxis = new THREE.Vector3();
+const _flinchAxis = new THREE.Vector3();
 function updateDmgNums(dt) {
   for (const s of dmgPool) {
     if (s.life <= 0) continue;
@@ -449,6 +511,13 @@ function inBeam(pos) {
   }
   return false;
 }
+function startPunch(e, dir) {
+  // start the procedural punch: 0.35 s lunge toward dir (see updateEnemy)
+  e.punchT = 0.35; e.punchDur = 0.35;
+  e.punchDir.copy(dir).setY(0);
+  if (e.punchDir.lengthSq() < 0.001) e.punchDir.set(0, 0, 1);
+  e.punchDir.normalize();
+}
 function flashEnemy(e) {
   e.flash = 0.12;
   e.obj.traverse((n) => { if (n.isMesh && n.material && n.material.emissive) n.material.emissive.setHex(0xffffff); });
@@ -480,7 +549,13 @@ function spawnEnemy(type, riftIdx) {
     // enemy intends to move but barely does; slideT latches a tangential
     // slide around the obstacle; slideDir picks which way around.
     stuckT: 0, slideT: 0, slideDir: rand() < 0.5 ? 1 : -1,
+    // procedural punch (user feedback): no attack clip exists in the GLBs
+    // (Idle/Walk/Run only), so a melee strike is a quick lunge + forward lean.
+    // punchOff holds last frame's visual offset so logic always sees the
+    // true position (it is subtracted at the top of the next updateEnemy).
+    punchT: 0, punchDur: 0.35, punchDir: new THREE.Vector3(), punchOff: new THREE.Vector3(),
   };
+  attachSlowMark(e);
   playClip(e, 'Walk');
   G.enemies.push(e);
   if (type === 'boss') { G.boss = e; }
@@ -509,15 +584,26 @@ function killEnemy(e) {
   burst(e.obj.position, e.type === 'boss' ? 0xff5a00 : 0xffc861, e.type === 'boss' ? 60 : 22, e.type === 'boss' ? 7 : 4);
   sfx.kill();
   G.hitStop = 0.06;
+  G.shake = Math.max(G.shake, 0.22); // small camera shake on kill (Jin polish)
   if (e.type !== 'boss' && rand() < 0.5) spawnEmber(e.obj.position);
   if (e.type === 'boss') { G.boss = null; winGame(); }
   scene.remove(e.obj);
+}
+// Big red "CORE -1" pulse (Jin polish): 0.3 s normally, longer + distinct
+// "LAST CHARGE!" text when only one charge remains.
+function showCoreFlash(text, long = false) {
+  el.coreFlash.textContent = text;
+  el.coreFlash.classList.remove('show', 'long');
+  void el.coreFlash.offsetWidth; // restart the CSS animation
+  if (long) el.coreFlash.classList.add('long');
+  el.coreFlash.classList.add('show');
 }
 function drainCore(e) {
   // enemy reached the tower
   G.core -= 1;
   burst(new THREE.Vector3(0, 2, 0), 0xff2a55, 26, 5);
   showDmgNum(new THREE.Vector3(0, 3.4, 0), 'CORE -1', 'hurt', 26);
+  showCoreFlash(G.core === 1 ? '⚠ CORE -1 — LAST CHARGE!' : 'CORE -1', G.core === 1);
   sfx.warn();
   G.shake = Math.max(G.shake, 0.5);
   e.dead = true;
@@ -531,11 +617,29 @@ function drainCore(e) {
 function updateEnemy(e, dt) {
   if (e.dead) return;
   const pos = e.obj.position;
+  // strip last frame's punch lunge: game logic always sees the true position
+  pos.sub(e.punchOff);
+  e.punchOff.set(0, 0, 0);
   if (e.flash > 0) { e.flash -= dt; if (e.flash <= 0) unflashEnemy(e); }
   if (e.stun > 0) { e.stun -= dt; playClip(e, 'Idle'); return; }
   const lit = inBeam(pos);
   e.lit = lit;
+  setSlowMark(e, lit);
   const slow = lit ? 0.55 : 1;
+  // punch animation: quick lunge toward the victim + forward lean, out and
+  // back over punchDur; the enemy holds still while punching.
+  if (e.punchT > 0) {
+    e.punchT -= dt;
+    const k = 1 - Math.max(0, e.punchT) / e.punchDur;
+    const ext = Math.sin(k * Math.PI);
+    e.punchOff.copy(e.punchDir).multiplyScalar(ext * 0.8);
+    pos.add(e.punchOff);
+    objFace(e.obj, e.punchDir);
+    _punchAxis.set(-e.punchDir.z, 0, e.punchDir.x);
+    e.obj.rotateOnWorldAxis(_punchAxis, ext * 0.3);
+    playClip(e, 'Idle');
+    return;
+  }
   // boss special attacks
   if (e.type === 'boss') { updateBoss(e, dt, slow); return; }
   // telegraph windup for brute heavy attack
@@ -547,6 +651,7 @@ function updateEnemy(e, dt) {
       if (dist2d(pos, player.pos) < 2.6 && player.invuln <= 0) hurtPlayer(e.def.dmg, pos);
       sfx.slam();
       G.shake = Math.max(G.shake, 0.3);
+      startPunch(e, new THREE.Vector3().subVectors(player.pos, pos));
     }
     playClip(e, 'Idle');
     return;
@@ -583,6 +688,7 @@ function updateEnemy(e, dt) {
   } else {
     move.copy(toPlayer.normalize());
     if (dPlayer < e.radius + player.radius + 0.25) {
+      objFace(e.obj, toPlayer);
       e.attackCd -= dt;
       if (e.attackCd <= 0) {
         e.attackCd = 1.1;
@@ -592,6 +698,7 @@ function updateEnemy(e, dt) {
           sfx.warn();
         } else {
           hurtPlayer(e.def.dmg, pos);
+          startPunch(e, toPlayer);
         }
       }
       playClip(e, 'Idle');
@@ -653,9 +760,11 @@ function updateBoss(e, dt, slow) {
   const dTower = toTower.length();
   // core exposed while caught in the light
   const exposed = inBeam(pos);
+  setSlowMark(e, exposed);
   if (exposed) {
     crystal.material.emissiveIntensity = 2.2;
-    e.obj.traverse((n) => { if (n.isMesh && n.material && n.material.emissive) n.material.emissive.setHex(0x662200); });
+    // hit-flash (white emissive) takes precedence over the exposed tint
+    if (e.flash <= 0) e.obj.traverse((n) => { if (n.isMesh && n.material && n.material.emissive) n.material.emissive.setHex(0x662200); });
   } else {
     e.obj.traverse((n) => { if (n.isMesh && n.material && n.material.emissive && e.flash <= 0) n.material.emissive.setHex(0x000000); });
   }
@@ -681,7 +790,7 @@ function updateBoss(e, dt, slow) {
       sfx.slam();
       G.shake = 1.0;
       if (dist2d(pos, player.pos) < 4.6 && player.invuln <= 0) hurtPlayer(e.def.dmg, pos);
-      if (dTower < 5.2) { G.core -= 1; showDmgNum(new THREE.Vector3(0, 3.4, 0), 'CORE -1', 'hurt', 26); sfx.warn(); updateHUD(); if (G.core <= 0) { loseGame('The Furnace Maw shattered the prism core.'); return; } }
+      if (dTower < 5.2) { G.core -= 1; showDmgNum(new THREE.Vector3(0, 3.4, 0), 'CORE -1', 'hurt', 26); showCoreFlash(G.core === 1 ? '⚠ CORE -1 — LAST CHARGE!' : 'CORE -1', G.core === 1); sfx.warn(); updateHUD(); if (G.core <= 0) { loseGame('The Furnace Maw shattered the prism core.'); return; } }
     }
     playClip(e, 'Idle');
     return;
@@ -723,6 +832,11 @@ function hurtPlayer(dmg, fromPos) {
   if (player.invuln > 0 || G.state !== 'playing') return;
   player.hp -= dmg;
   player.invuln = 0.7;
+  // hit reaction (user feedback): crouch + stagger away from the hit, 0.3 s
+  player.flinchT = 0.3;
+  player.flinchDir.copy(player.pos).sub(fromPos).setY(0);
+  if (player.flinchDir.lengthSq() < 0.001) player.flinchDir.set(0, 0, 1);
+  else player.flinchDir.normalize();
   showDmgNum(player.pos, '-' + dmg, 'hurt', 24);
   burst(player.pos, 0xff3a2a, 12, 3);
   sfx.hurt();
@@ -779,8 +893,23 @@ function updatePlayer(dt) {
   player.dashCd -= dt;
   player.invuln -= dt;
   if (player.invuln > 0 && player.obj) {
-    player.obj.visible = Math.floor(G.time * 14) % 2 === 0;
+    // keep the flinch fully visible: blink only once the crouch is over
+    player.obj.visible = player.flinchT > 0 ? true : (Math.floor(G.time * 14) % 2 === 0);
   } else if (player.obj) player.obj.visible = true;
+  // flinch: crouch down + hunch forward + stagger back, out and back over 0.3 s.
+  // Applied after obj.position.copy(player.pos) above, so it is purely visual
+  // and is overwritten by the next frame's copy.
+  if (player.flinchT > 0 && player.obj) {
+    player.flinchT -= dt;
+    const k = 1 - Math.max(0, player.flinchT) / 0.3;
+    const ext = Math.sin(k * Math.PI);
+    player.obj.position.y -= 0.45 * ext;
+    player.obj.position.addScaledVector(player.flinchDir, 0.35 * ext);
+    const yaw = Math.atan2(player.aim.x, player.aim.z);
+    player.obj.rotation.set(0, yaw, 0);
+    _flinchAxis.set(-player.aim.z, 0, player.aim.x);
+    player.obj.rotateOnWorldAxis(_flinchAxis, 0.45 * ext);
+  }
   // dash
   if (keys['Space'] && player.dashCd <= 0 && player.dashTime <= 0) {
     keys['Space'] = false;
@@ -993,6 +1122,8 @@ function updateHUD() {
   let coreHtml = '';
   for (let i = 0; i < G.coreMax; i++) coreHtml += i < G.core ? '<span class="on">◆</span>' : '<span class="off">◆</span>';
   el.core.innerHTML = coreHtml || '<span class="off">◆</span>';
+  // last-charge warning: pulse the PRISM CORE panel red while 1 is left
+  el.corePanel.classList.toggle('critical', G.core === 1);
   el.waveText.textContent = G.wave;
   const t = Math.floor(G.waveTime);
   const par = PAR_TIME[G.wave - 1];
@@ -1016,8 +1147,15 @@ window.addEventListener('keydown', (ev) => {
   }
   if (ev.code === 'KeyR' && (G.state === 'playing' || G.state === 'victory' || G.state === 'defeat' || G.state === 'paused' || G.state === 'upgrade')) startGame();
   if (ev.code === 'Escape' || ev.code === 'KeyP') {
-    if (G.state === 'playing') { G.pausedFrom = 'playing'; G.state = 'paused'; el.pause.classList.remove('hidden'); }
-    else if (G.state === 'paused') { G.state = 'playing'; el.pause.classList.add('hidden'); }
+    if (G.state === 'playing') {
+      G.pausedFrom = 'playing'; G.state = 'paused'; el.pause.classList.remove('hidden');
+      // B01: hide the wave banner while paused so it never sits behind PAUSED
+      el.banner.classList.add('hidden');
+    } else if (G.state === 'paused') {
+      G.state = 'playing'; el.pause.classList.add('hidden');
+      // B01: only bring the banner back if its window has not expired
+      if (G.bannerTimer > 0) el.banner.classList.remove('hidden');
+    }
   }
   if (ev.code === 'KeyM') sfx.toggleMute();
   if (G.state === 'upgrade') {
@@ -1039,6 +1177,15 @@ window.addEventListener('mousedown', (ev) => {
 });
 window.addEventListener('mouseup', (ev) => { if (ev.button === 0) mouseDown = false; });
 $('restart-btn').addEventListener('click', () => startGame());
+// camera-shake toggle (pause menu; persisted)
+function syncShakeBtn() { el.shakeBtn.textContent = 'Camera shake: ' + (G.shakeOn ? 'ON' : 'OFF'); }
+try { G.shakeOn = localStorage.getItem('gloamguard_shake') !== '0'; } catch {}
+syncShakeBtn();
+el.shakeBtn.addEventListener('click', () => {
+  G.shakeOn = !G.shakeOn;
+  try { localStorage.setItem('gloamguard_shake', G.shakeOn ? '1' : '0'); } catch {}
+  syncShakeBtn();
+});
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
@@ -1064,7 +1211,7 @@ function updateCamera(dt) {
   const want = new THREE.Vector3(player.pos.x * 0.55, 15.5, player.pos.z * 0.55 + 12.5);
   camera.position.lerp(want, 1 - Math.pow(0.0001, dt));
   const look = new THREE.Vector3(player.pos.x * 0.85, 0.8, player.pos.z * 0.85 - 1.5);
-  if (G.shake > 0) {
+  if (G.shake > 0 && G.shakeOn) {
     look.x += (rand() - 0.5) * G.shake * 0.5;
     look.y += (rand() - 0.5) * G.shake * 0.3;
   }
@@ -1072,7 +1219,10 @@ function updateCamera(dt) {
 }
 
 // ---------- main update ----------
-const clock = new THREE.Clock();
+// B04: THREE.Clock is deprecated in r187 — THREE.Timer is the equivalent
+// (update() then getDelta() in seconds; same wall-clock semantics, dt still
+// capped at 0.05 below, so behaviour is unchanged).
+const timer = new THREE.Timer();
 function update(dt) {
   G.time += dt;
   // beam rotation (always, even on title — the arena is alive)
@@ -1146,7 +1296,8 @@ function update(dt) {
 }
 function frame() {
   requestAnimationFrame(frame);
-  let dt = Math.min(clock.getDelta(), 0.05);
+  timer.update();
+  let dt = Math.min(timer.getDelta(), 0.05);
   if (G.hitStop > 0) { G.hitStop -= dt; dt = 0; }
   if (G.state !== 'paused') update(dt);
   renderer.render(scene, camera);
