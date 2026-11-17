@@ -529,13 +529,32 @@ function showDmgNum(worldPos, text, cls = '', size = 20) {
 // 0.40 + 2.55 + 1.00 + 0.25 = 4.20 s, boss charge sequence
 // 0.60 + 0.25 + 0.70 + 1.00 + 3.75 = 6.30 s. Damage still lands at the
 // end of the hold / lunge; dTrue reach fix from R3 is unchanged.
-const PUNCH_DUR = 0.40, PUNCH_LUNGE = 1.3, PUNCH_LEAN = 0.5;
-const STALKER_WINDUP = 0.50, STALKER_HOLD = 0.30, STALKER_BACK = 0.7, STALKER_LEAN = 0.5;
-const BRUTE_WINDUP = 0.7, BRUTE_HOLD = 0.25, BRUTE_BACK = 0.8, BRUTE_LEAN = 0.55;
-const BOSS_WINDUP = 1.0, BOSS_HOLD = 0.25, BOSS_BACK = 0.9, BOSS_LEAN = 0.6;
+const PUNCH_DUR = 0.40; // R6: lunge/lean removed — strikes are arm-only
+const STALKER_WINDUP = 0.50, STALKER_HOLD = 0.30;
+const BRUTE_WINDUP = 0.7, BRUTE_HOLD = 0.25;
+const BOSS_WINDUP = 1.0, BOSS_HOLD = 0.25;
 const BOSS_CHARGE_WINDUP = 0.6, BOSS_CHARGE_HOLD = 0.25, BOSS_CHARGE_BACK = 0.9, BOSS_CHARGE_LEAN = 0.6;
 const STALKER_CD = 0.75, BRUTE_CD = 0.80, BOSS_SLAM_CD = 2.55, BOSS_CHARGE_CD = 3.75; // see R4 note above
 const FLINCH_DUR = 0.45, FLINCH_DROP = 0.8, FLINCH_STAGGER = 0.7, FLINCH_LEAN = 0.75;
+// R6 (user feedback: "hanya tangan yang digerakkan"): strikes are ARM-ONLY.
+// The body stays planted — no step-back, no lean, no lunge. Only the right
+// arm moves: the stalker slashes diagonally like a knife (cocked overhead,
+// swept down-forward); brute/boss throw a straight punch (cocked up-back,
+// extended straight forward). Timing, damage, attackCd/cadence and reach
+// are UNCHANGED; only the visual pose changes. Bone axes (verified live on
+// all three enemy rigs, same Mixamo skeleton): shoulder rotation.y swings
+// the arm forward/back, rotation.z raises/lowers it, rotation.x only twists
+// it. The elbow stays straight (fore 0,0,0) in every pose. Poses are
+// ABSOLUTE shoulder rotations (x,y,z), applied in a post-pass after the
+// mixers run (the Idle/Walk clip would otherwise overwrite them the same
+// frame). A windup captures the clip's current arm rotation so the arm
+// blends out of the walk/idle swing instead of snapping; a 0.15 s recover
+// eases it back to the clip pose after the strike.
+const ARM_SLASH_COCK = [0, 0.3, -1.3];  // stalker: knife raised overhead
+const ARM_SLASH_END = [0, 1.4, 0.9];    // stalker: swept down-forward
+const ARM_PUNCH_COCK = [0, -0.5, -1.0]; // brute/boss: fist cocked up-back
+const ARM_PUNCH_END = [0, 1.57, 0.0];   // brute/boss: fist straight forward
+const ARM_RECOVER = 0.15;
 const _v = new THREE.Vector3();
 const _punchAxis = new THREE.Vector3();
 const _flinchAxis = new THREE.Vector3();
@@ -603,6 +622,65 @@ function windupPose(e, dir, back, lean, k) {
   if (e.flash <= 0) e.obj.traverse((n) => { if (n.isMesh && n.material && n.material.emissive) n.material.emissive.setHex(0x881111); });
 }
 
+// R6: arm-only telegraph — face the victim + red glow, but NO step-back and
+// NO lean: the body stays planted while the arm cocks back (see
+// applyArmStrikes). The old windupPose is kept for the boss CHARGE, whose
+// rear-back telegraphs a body dash (the dash itself is body movement).
+function armTelegraph(e, dir) {
+  e.obj.rotation.set(0, Math.atan2(dir.x, dir.z), 0);
+  if (e.flash <= 0) e.obj.traverse((n) => { if (n.isMesh && n.material && n.material.emissive) n.material.emissive.setHex(0x881111); });
+}
+const _lerp3 = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+const _smooth = (t) => t * t * (3 - 2 * t);
+// R6: compute this frame's arm pose for one enemy from its strike phase.
+// Returns { arm, fore } (absolute shoulder / elbow rotations) or null when
+// no strike is in flight. Called from applyArmStrikes() AFTER the mixers
+// run, so the clip pose is already written and can be read (windup start
+// capture, recover target) before being overridden.
+function armStrikePose(e, dt) {
+  const brute = e.type === 'brute' || e.type === 'boss';
+  const cock = brute ? ARM_PUNCH_COCK : ARM_SLASH_COCK;
+  const end = brute ? ARM_PUNCH_END : ARM_SLASH_END;
+  if (e.punchT > 0) {
+    e._armPhase = 'punch';
+    // strike sweep: cocked -> extended, accelerating (k^2)
+    const k = 1 - Math.max(0, e.punchT) / e.punchDur;
+    return { arm: _lerp3(cock, end, k * k), fore: [0, 0, 0] };
+  }
+  if (e.holdT > 0) { e._armPhase = 'hold'; return { arm: cock.slice(), fore: [0, 0, 0] }; }
+  if (e.windup > 0) {
+    if (e._armPhase !== 'windup') {
+      // capture the clip's current arm pose so the windup blends out of it
+      e._armStart = [e.armR.rotation.x, e.armR.rotation.y, e.armR.rotation.z];
+      e._armPhase = 'windup';
+    }
+    const wMax = e.type === 'brute' ? BRUTE_WINDUP : e.type === 'boss' ? BOSS_WINDUP : STALKER_WINDUP;
+    const wk = 1 - Math.max(0, e.windup) / wMax; // 0 -> 1 over the windup
+    return { arm: _lerp3(e._armStart, cock, _smooth(wk)), fore: [0, 0, 0] };
+  }
+  // recover: ease the arm from the extended pose back to the live clip pose
+  if (e._armPhase === 'punch' || e._armPhase === 'recover') {
+    if (e._armPhase === 'punch') { e._armPhase = 'recover'; e._armRec = ARM_RECOVER; }
+    e._armRec -= dt;
+    if (e._armRec <= 0) { e._armPhase = null; return null; }
+    const t = _smooth(1 - e._armRec / ARM_RECOVER);
+    const now = [e.armR.rotation.x, e.armR.rotation.y, e.armR.rotation.z];
+    const nowF = [e.foreR.rotation.x, e.foreR.rotation.y, e.foreR.rotation.z];
+    return { arm: _lerp3(end, now, t), fore: _lerp3([0, 0, 0], nowF, t) };
+  }
+  e._armPhase = null;
+  return null;
+}
+function applyArmStrikes(dt) {
+  for (const e of G.enemies) {
+    if (e.dead || !e.armR || !e.foreR) continue;
+    const pose = armStrikePose(e, dt);
+    if (!pose) continue;
+    e.armR.rotation.set(pose.arm[0], pose.arm[1], pose.arm[2]);
+    e.foreR.rotation.set(pose.fore[0], pose.fore[1], pose.fore[2]);
+  }
+}
+
 // ---------- enemies ----------
 function spawnEnemy(type, riftIdx) {
   const def = ENEMY_DEF[type];
@@ -633,6 +711,11 @@ function spawnEnemy(type, riftIdx) {
     punchT: 0, punchDur: 0.35, punchDir: new THREE.Vector3(), punchOff: new THREE.Vector3(),
   };
   attachSlowMark(e);
+  // R6: cache the right-arm bones for the arm-only strike (all three enemy
+  // rigs share the same Mixamo skeleton names; verified live on each GLB).
+  e.armR = obj.getObjectByName('RightArm');
+  e.foreR = obj.getObjectByName('RightForeArm');
+  e._armPhase = null; e._armStart = null; e._armRec = 0;
   playClip(e, 'Walk');
   G.enemies.push(e);
   if (type === 'boss') { G.boss = e; }
@@ -703,43 +786,30 @@ function updateEnemy(e, dt) {
   e.lit = lit;
   setSlowMark(e, lit);
   const slow = lit ? 0.55 : 1;
-  // punch animation: big lunge toward the victim + forward lean, out and
-  // back over punchDur; the enemy holds still while punching.
-  // The lean is NEGATIVE: about the (-dir.z, 0, dir.x) axis a positive angle
-  // tilts the top AWAY from the victim (measured -0.29 leanFwd at peak with
-  // the old +0.3), so the strike leans forward with a negative angle.
-  // rotation.set() resets the tilt every frame: the lean is absolute, never
-  // accumulated across strikes (see the R2 note above the constants).
+  // R6 punch: ARM-ONLY — the body holds still (no lunge, no lean); the arm
+  // sweep is applied by applyArmStrikes() after the mixers run. Damage,
+  // timing and cadence are unchanged (see the R2/R3/R4 notes above).
   if (e.punchT > 0) {
     e.punchT -= dt;
-    const k = 1 - Math.max(0, e.punchT) / e.punchDur;
-    const ext = Math.sin(k * Math.PI);
-    e.punchOff.copy(e.punchDir).multiplyScalar(ext * PUNCH_LUNGE);
-    pos.add(e.punchOff);
     e.obj.rotation.set(0, Math.atan2(e.punchDir.x, e.punchDir.z), 0);
-    _punchAxis.set(-e.punchDir.z, 0, e.punchDir.x);
-    e.obj.rotateOnWorldAxis(_punchAxis, -ext * PUNCH_LEAN);
     playClip(e, 'Idle');
     return;
   }
   // boss special attacks
   if (e.type === 'boss') { updateBoss(e, dt, slow); return; }
   // telegraph windup before a melee strike lands (brute slam / stalker
-  // strike): the enemy rears BACK away from the victim — step back + backward
-  // lean + red glow + ground ring — growing through the windup, then FREEZES
-  // at the peak for HOLD, then the strike lunges forward. Damage still lands
-  // at the end of the hold, on the same attack cycle as before (see the
-  // in-range branch below and the R3 note above the constants).
+  // strike): R6 — the enemy stays planted and only the ARM cocks back
+  // (shoulder rises, see applyArmStrikes), plus the red glow + ground ring.
+  // The strike still lands at the end of the hold, on the same attack cycle
+  // as before (see the in-range branch below and the R3 note above the
+  // constants).
   if (e.windup > 0) {
     e.windup -= dt;
     const brute = e.type === 'brute';
-    const wMax = brute ? BRUTE_WINDUP : STALKER_WINDUP;
-    const wk = 1 - Math.max(0, e.windup) / wMax; // 0 -> 1 over the windup
-    const back = Math.sin(wk * Math.PI * 0.5);
     const toP = new THREE.Vector3().subVectors(player.pos, pos).setY(0);
     if (toP.lengthSq() > 0.001) {
       toP.normalize();
-      windupPose(e, toP, brute ? BRUTE_BACK : STALKER_BACK, brute ? BRUTE_LEAN : STALKER_LEAN, back);
+      armTelegraph(e, toP);
     }
     if (e.windup <= 0) {
       // R3: freeze at the peak for HOLD before the lunge, so the eye can
@@ -750,7 +820,8 @@ function updateEnemy(e, dt) {
     playClip(e, 'Idle');
     return;
   }
-  // R3 hold: frozen at peak windup (full step-back + lean + red glow + ring)
+  // R3 hold: frozen at the cocked arm pose (red glow + ring stay on).
+  // R6: the body stays planted; only the arm is frozen up.
   if (e.holdT > 0) {
     e.holdT -= dt;
     const brute = e.type === 'brute';
@@ -763,11 +834,13 @@ function updateEnemy(e, dt) {
     // (probe-r3-diag: 4+ clean windup -> hold -> lunge cycles, hp never
     // dropped). The trigger still requires true range at windup start, and
     // the player can still dodge by moving away during the 0.5 s telegraph.
+    // R6: the step-back is gone, so dTrue now always equals the visual
+    // position — the check is kept as-is.
     const dTrue = dist2d(pos, player.pos);
     const toP = new THREE.Vector3().subVectors(player.pos, pos).setY(0);
     if (toP.lengthSq() > 0.001) {
       toP.normalize();
-      windupPose(e, toP, brute ? BRUTE_BACK : STALKER_BACK, brute ? BRUTE_LEAN : STALKER_LEAN, 1);
+      armTelegraph(e, toP);
     }
     if (e.holdT <= 0) {
       if (e.flash <= 0) unflashEnemy(e); // restore the telegraph glow
@@ -945,18 +1018,19 @@ function updateBoss(e, dt, slow) {
     playClip(e, 'Run');
     return;
   }
-  // R3 hold: frozen at peak slam windup before the slam lands.
+  // R3 hold: frozen at the cocked arm pose before the slam lands.
+  // R6: the body stays planted; only the arm is frozen up.
   if (e.holdT > 0) {
     e.holdT -= dt;
     // R3: judge the hit from the TRUE distance, captured BEFORE this frame's
-    // pose is applied (same reason as the stalker/brute hold above: the
-    // 0.9 u step-back would otherwise push the visual pos past the 4.6 u
-    // slam reach whenever the slam triggered near max range).
+    // pose is applied (same reason as the stalker/brute hold above).
+    // R6: the step-back is gone, so dTrue now always equals the visual
+    // position — the check is kept as-is.
     const dTrue = dist2d(pos, player.pos);
     const dir = new THREE.Vector3().subVectors(player.pos, pos).setY(0);
     if (dir.lengthSq() > 0.001) {
       dir.normalize();
-      windupPose(e, dir, BOSS_BACK, BOSS_LEAN, 1);
+      armTelegraph(e, dir);
     }
     if (e.holdT <= 0) {
       if (e.flash <= 0) unflashEnemy(e); // clear the telegraph glow
@@ -973,14 +1047,12 @@ function updateBoss(e, dt, slow) {
   }
   if (e.windup > 0) { // slam windup
     e.windup -= dt;
-    // R3: rear back before the slam — step back + backward lean, growing
-    // through the 1.0 s windup, then a 0.25 s freeze at the peak (hold);
-    // the slam itself now lunges forward too.
-    const wk = 1 - Math.max(0, e.windup) / BOSS_WINDUP;
-    const back = Math.sin(wk * Math.PI * 0.5);
+    // R6: the arm cocks back (see applyArmStrikes); the body stays planted.
+    // (The R3 rear-back is kept only for the CHARGE windup below, whose
+    // dash is body movement by nature.)
     if (toPlayer.lengthSq() > 0.001) {
       const dir = toPlayer.clone().normalize();
-      windupPose(e, dir, BOSS_BACK, BOSS_LEAN, back);
+      armTelegraph(e, dir);
     }
     if (e.windup <= 0) {
       // R3: freeze at the peak before the slam (see the hold branch above).
@@ -1499,6 +1571,9 @@ function update(dt) {
   updateTelegraphs(dt);
   updateDmgNums(dt);
   for (const m of mixers) m.update(dt);
+  // R6: arm-only strikes are applied AFTER the mixers run, or the
+  // Idle/Walk clip would overwrite the bone rotations the same frame.
+  applyArmStrikes(dt);
   updateCamera(dt);
 }
 function frame() {
