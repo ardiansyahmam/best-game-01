@@ -514,13 +514,27 @@ function showDmgNum(worldPos, text, cls = '', size = 20) {
 // radius so the ring never overstates the hit). One subtlety the bigger
 // step-back exposed: the landing reach is judged from the TRUE position
 // (before the frame's pose), because the rear-back is a pose, not a
-// teleport — judging from the visual pos made max-range strikes whiff.
+// R4 (user feedback): R3's animation was all there, but the verification
+// browser only yields SEPARATE still frames, not continuous video — a 0.10 s
+// hold and sub-second moves cannot be judged reliably from stills. So the
+// phases are lengthened until EACH one is capturable in a still frame:
+// stalker windup 0.40 -> 0.50 s and HOLD 0.10 -> 0.30 s (frozen at the peak
+// long enough for one still frame); brute/boss HOLD 0.10 -> 0.25 s (windups
+// unchanged). Cadence is preserved by the same R2/R3 compensation — the
+// post-strike countdown is shortened by exactly the added phase time.
+// True cycle = punch (0.40, attackCd frozen) + countdown + windup + hold:
+// stalker 0.40 + 0.25 + 0.50 + 0.30 = 1.45 s (CD 0.75, windup triggers at
+// attackCd <= 0.50, so the countdown runs 0.75 -> 0.50), brute
+// 0.40 + 0.80 + 0.70 + 0.25 = 2.15 s, boss slam
+// 0.40 + 2.55 + 1.00 + 0.25 = 4.20 s, boss charge sequence
+// 0.60 + 0.25 + 0.70 + 1.00 + 3.75 = 6.30 s. Damage still lands at the
+// end of the hold / lunge; dTrue reach fix from R3 is unchanged.
 const PUNCH_DUR = 0.40, PUNCH_LUNGE = 1.3, PUNCH_LEAN = 0.5;
-const STALKER_WINDUP = 0.40, STALKER_HOLD = 0.10, STALKER_BACK = 0.7, STALKER_LEAN = 0.5;
-const BRUTE_WINDUP = 0.7, BRUTE_HOLD = 0.10, BRUTE_BACK = 0.8, BRUTE_LEAN = 0.55;
-const BOSS_WINDUP = 1.0, BOSS_HOLD = 0.10, BOSS_BACK = 0.9, BOSS_LEAN = 0.6;
-const BOSS_CHARGE_WINDUP = 0.6, BOSS_CHARGE_HOLD = 0.10, BOSS_CHARGE_BACK = 0.9, BOSS_CHARGE_LEAN = 0.6;
-const STALKER_CD = 0.95, BRUTE_CD = 0.95, BOSS_SLAM_CD = 2.70, BOSS_CHARGE_CD = 3.9; // see above
+const STALKER_WINDUP = 0.50, STALKER_HOLD = 0.30, STALKER_BACK = 0.7, STALKER_LEAN = 0.5;
+const BRUTE_WINDUP = 0.7, BRUTE_HOLD = 0.25, BRUTE_BACK = 0.8, BRUTE_LEAN = 0.55;
+const BOSS_WINDUP = 1.0, BOSS_HOLD = 0.25, BOSS_BACK = 0.9, BOSS_LEAN = 0.6;
+const BOSS_CHARGE_WINDUP = 0.6, BOSS_CHARGE_HOLD = 0.25, BOSS_CHARGE_BACK = 0.9, BOSS_CHARGE_LEAN = 0.6;
+const STALKER_CD = 0.75, BRUTE_CD = 0.80, BOSS_SLAM_CD = 2.55, BOSS_CHARGE_CD = 3.75; // see R4 note above
 const FLINCH_DUR = 0.45, FLINCH_DROP = 0.8, FLINCH_STAGGER = 0.7, FLINCH_LEAN = 0.75;
 const _v = new THREE.Vector3();
 const _punchAxis = new THREE.Vector3();
@@ -763,14 +777,14 @@ function updateEnemy(e, dt) {
         if (dTrue < 2.6 && player.invuln <= 0) hurtPlayer(e.def.dmg, pos);
         sfx.slam();
         G.shake = Math.max(G.shake, 0.3);
-        e.attackCd = BRUTE_CD; // keeps the 2.15 s slam interval (see R3 note)
+        e.attackCd = BRUTE_CD; // keeps the 2.15 s slam interval (see R3/R4 note)
         startPunch(e, new THREE.Vector3().subVectors(player.pos, pos));
       } else {
         // stalker strike lands at the lunge: damage only if the victim is
         // still in reach — the telegraph is dodgeable, like the brute slam.
         // Reach is judged from dTrue (see above), not the backed-up visual pos.
         if (dTrue < e.radius + player.radius + 0.6 && player.invuln <= 0) hurtPlayer(e.def.dmg, pos);
-        e.attackCd = STALKER_CD; // keeps the 1.45 s strike interval (see R3 note)
+        e.attackCd = STALKER_CD; // keeps the 1.45 s strike interval (see R3/R4 note)
         startPunch(e, new THREE.Vector3().subVectors(player.pos, pos));
       }
     }
@@ -820,8 +834,8 @@ function updateEnemy(e, dt) {
           sfx.warn();
         }
       } else if (e.attackCd <= STALKER_WINDUP && e.windup <= 0 && e.punchT <= 0) {
-        // R3: the strike is telegraphed for the last 0.40 s of the attack
-        // cycle + 0.10 s hold, so damage still lands exactly one 1.45 s
+        // R4: the strike is telegraphed for the last 0.50 s of the attack
+        // cycle + 0.30 s hold, so damage still lands exactly one 1.45 s
         // cycle after the previous strike; the hold handler above lands it
         // at the lunge.
         e.windup = STALKER_WINDUP;
@@ -902,7 +916,7 @@ function updateBoss(e, dt, slow) {
   if (e.chargeState === 'windup') {
     e.chargeT -= dt;
     // R3: rear back before the rush — step back + backward lean, growing
-    // through the 0.6 s windup, then a 0.10 s freeze at the peak (hold).
+    // through the 0.6 s windup, then a 0.25 s freeze at the peak (hold).
     const wk = 1 - Math.max(0, e.chargeT) / BOSS_CHARGE_WINDUP;
     const back = Math.sin(wk * Math.PI * 0.5);
     if (e.chargeDir.lengthSq() > 0.001) {
@@ -950,7 +964,7 @@ function updateBoss(e, dt, slow) {
       sfx.slam();
       G.shake = 1.0;
       if (dTrue < 4.6 && player.invuln <= 0) hurtPlayer(e.def.dmg, pos);
-      e.attackCd = BOSS_SLAM_CD; // keeps the 4.20 s slam interval (see R3 note)
+      e.attackCd = BOSS_SLAM_CD; // keeps the 4.20 s slam interval (see R3/R4 note)
       startPunch(e, toPlayer.clone());
       if (dTower < 5.2) { G.core -= 1; showDmgNum(new THREE.Vector3(0, 3.4, 0), 'CORE -1', 'hurt', 26); showCoreFlash(G.core === 1 ? '⚠ CORE -1 — LAST CHARGE!' : 'CORE -1', G.core === 1); sfx.warn(); updateHUD(); if (G.core <= 0) { loseGame('The Furnace Maw shattered the prism core.'); return; } }
     }
@@ -960,7 +974,7 @@ function updateBoss(e, dt, slow) {
   if (e.windup > 0) { // slam windup
     e.windup -= dt;
     // R3: rear back before the slam — step back + backward lean, growing
-    // through the 1.0 s windup, then a 0.10 s freeze at the peak (hold);
+    // through the 1.0 s windup, then a 0.25 s freeze at the peak (hold);
     // the slam itself now lunges forward too.
     const wk = 1 - Math.max(0, e.windup) / BOSS_WINDUP;
     const back = Math.sin(wk * Math.PI * 0.5);
@@ -987,8 +1001,9 @@ function updateBoss(e, dt, slow) {
       return;
     }
     if (dPlayer > 6 && dPlayer < 14 && rand() < 0.6) {
-      // R3: post-charge countdown 4.0 -> 3.9 pays back the 0.10 s charge hold,
-      // so the charge-to-next-attack sequence stays 6.30 s (see R3 note).
+      // R4: post-charge countdown 3.9 -> 3.75 pays back the extra 0.15 s
+      // charge hold, so the charge-to-next-attack sequence stays 6.30 s
+      // (see R4 note).
       e.attackCd = BOSS_CHARGE_CD;
       e.chargeState = 'windup'; e.chargeT = BOSS_CHARGE_WINDUP;
       e.chargeDir.copy(toPlayer.normalize());
