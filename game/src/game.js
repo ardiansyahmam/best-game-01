@@ -1627,12 +1627,14 @@ async function runShot() {
       player.hp = 72;
       botHold = true;
       const boss = spawnEnemy('boss', 0);
-      boss.obj.position.set(4, 0, 2);
+      boss.obj.position.set(6, 0, 6);
+      boss.targetTower = false; // staged shot: boss hunts the hero, never drains the core
       boss.attackCd = 2.5;
       const addSpots = [[-8, -7], [7, -7], [0, -9]];
       for (let i = 0; i < 3; i++) {
         const e = spawnEnemy('stalker', (i + 1) % 3);
         e.obj.position.set(addSpots[i][0], 0, addSpots[i][1]);
+        e.targetTower = false; // staged shot: adds hunt the hero too, never drain the core
       }
       const realUpdate = update;
       for (let i = 0; i < 120; i++) { botInput(); realUpdate(1 / 60); renderer.render(scene, camera); }
@@ -1656,6 +1658,7 @@ async function runShot() {
       G.core = 3;
       const e = spawnEnemy('stalker', 0);
       e.obj.position.set(-4, 0, -4);
+      e.targetTower = false; // staged shot: stalker hunts the hero, never drains the core
       stepFrames(60);
       winGame();
       stepFrames(30);
