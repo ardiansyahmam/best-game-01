@@ -86,6 +86,7 @@ const player = {
   hp: 100, hpMax: 100, speed: 7, fireCd: 0, dashCd: 0, dashTime: 0, dashDir: new THREE.Vector3(),
   invuln: 0, moving: false, mixer: null, obj: null, radius: 0.7,
   flinchT: 0, flinchDir: new THREE.Vector3(0, 0, 1), // hit reaction (user feedback)
+  baseScale: new THREE.Vector3(1, 1, 1), // hero model scale (set in init)
 };
 const keys = {};
 let mouseNDC = new THREE.Vector2(0, 0);
@@ -475,6 +476,29 @@ function showDmgNum(worldPos, text, cls = '', size = 20) {
   slot.el.style.fontSize = size + 'px';
   slot.el.style.display = 'block';
 }
+// R2: readable melee strikes + player hit reaction (user feedback).
+// Visual only: damage amounts, spawn lists, and the damage cadence are
+// unchanged. Two things that LOOK like difficulty but are not:
+//  - the lean is applied ABSOLUTELY (rotation.set(0, yaw, 0) + one
+//    rotateOnWorldAxis per frame): the old objFace + rotateOnWorldAxis
+//    applied the lean INCREMENTALLY, so it accumulated across strikes at
+//    non-gimbal yaws (a stalker measured upY -0.25, nearly upside down,
+//    after a dozen strikes). The punch lean is now FORWARD (negative
+//    angle): the old +0.3 leaned BACKWARD, away from the victim — a recoil,
+//    not a strike (measured leanFwd -0.29 at peak).
+//  - strike cadence is preserved by shortening the post-strike attackCd
+//    countdown by exactly the extra punch time: the punch freezes attackCd
+//    while it plays, so stalker 0.55 + 0.90 = 1.45 s (was 0.35 + 1.10),
+//    brute 0.70 + 0.55 + 0.90 = 2.15 s (was 0.70 + 0.35 + 1.10), boss slam
+//    1.00 + 0.55 + 2.65 = 4.20 s (was 1.00 + 3.20). The stalker windup
+//    0.28 s is the last 0.28 s of that 0.90 s countdown.
+// Flinch: 0.30 -> 0.45 s, drop 0.45 -> 0.8 u, stagger 0.35 -> 0.7 u, plus a
+// squash (shorter + wider) — the squash is what reads from the high camera,
+// where a vertical drop alone is foreshortened away.
+const PUNCH_DUR = 0.55, PUNCH_LUNGE = 1.3, PUNCH_LEAN = 0.5;
+const STALKER_WINDUP = 0.28, WINDUP_LEAN = 0.35, WINDUP_BACK = 0.4;
+const STALKER_CD = 0.9, BRUTE_CD = 0.9, BOSS_SLAM_CD = 2.65; // see above
+const FLINCH_DUR = 0.45, FLINCH_DROP = 0.8, FLINCH_STAGGER = 0.7, FLINCH_LEAN = 0.75;
 const _v = new THREE.Vector3();
 const _punchAxis = new THREE.Vector3();
 const _flinchAxis = new THREE.Vector3();
@@ -512,8 +536,8 @@ function inBeam(pos) {
   return false;
 }
 function startPunch(e, dir) {
-  // start the procedural punch: 0.35 s lunge toward dir (see updateEnemy)
-  e.punchT = 0.35; e.punchDur = 0.35;
+  // start the procedural punch: PUNCH_DUR lunge toward dir (see updateEnemy)
+  e.punchT = PUNCH_DUR; e.punchDur = PUNCH_DUR;
   e.punchDir.copy(dir).setY(0);
   if (e.punchDir.lengthSq() < 0.001) e.punchDir.set(0, 0, 1);
   e.punchDir.normalize();
@@ -626,32 +650,67 @@ function updateEnemy(e, dt) {
   e.lit = lit;
   setSlowMark(e, lit);
   const slow = lit ? 0.55 : 1;
-  // punch animation: quick lunge toward the victim + forward lean, out and
+  // punch animation: big lunge toward the victim + forward lean, out and
   // back over punchDur; the enemy holds still while punching.
+  // The lean is NEGATIVE: about the (-dir.z, 0, dir.x) axis a positive angle
+  // tilts the top AWAY from the victim (measured -0.29 leanFwd at peak with
+  // the old +0.3), so the strike leans forward with a negative angle.
+  // rotation.set() resets the tilt every frame: the lean is absolute, never
+  // accumulated across strikes (see the R2 note above the constants).
   if (e.punchT > 0) {
     e.punchT -= dt;
     const k = 1 - Math.max(0, e.punchT) / e.punchDur;
     const ext = Math.sin(k * Math.PI);
-    e.punchOff.copy(e.punchDir).multiplyScalar(ext * 0.8);
+    e.punchOff.copy(e.punchDir).multiplyScalar(ext * PUNCH_LUNGE);
     pos.add(e.punchOff);
-    objFace(e.obj, e.punchDir);
+    e.obj.rotation.set(0, Math.atan2(e.punchDir.x, e.punchDir.z), 0);
     _punchAxis.set(-e.punchDir.z, 0, e.punchDir.x);
-    e.obj.rotateOnWorldAxis(_punchAxis, ext * 0.3);
+    e.obj.rotateOnWorldAxis(_punchAxis, -ext * PUNCH_LEAN);
     playClip(e, 'Idle');
     return;
   }
   // boss special attacks
   if (e.type === 'boss') { updateBoss(e, dt, slow); return; }
-  // telegraph windup for brute heavy attack
+  // telegraph windup before a melee strike lands (brute slam / stalker
+  // strike): the enemy rears BACK away from the victim — step back + backward
+  // lean + red glow + ground ring — growing through the windup, then the
+  // strike lunges forward. Damage still lands at the lunge, on the same
+  // attack cycle as before (see the in-range branch below).
   if (e.windup > 0) {
     e.windup -= dt;
+    const wMax = e.type === 'brute' ? 0.7 : STALKER_WINDUP;
+    const wk = 1 - Math.max(0, e.windup) / wMax; // 0 -> 1 over the windup
+    const back = Math.sin(wk * Math.PI * 0.5);
+    const toP = new THREE.Vector3().subVectors(player.pos, pos).setY(0);
+    if (toP.lengthSq() > 0.001) {
+      toP.normalize();
+      e.punchOff.copy(toP).multiplyScalar(-WINDUP_BACK * back);
+      pos.add(e.punchOff);
+      // absolute lean (rotation.set resets the tilt every frame — see above)
+      e.obj.rotation.set(0, Math.atan2(toP.x, toP.z), 0);
+      _punchAxis.set(-toP.z, 0, toP.x);
+      // positive angle = lean back, away from the victim
+      e.obj.rotateOnWorldAxis(_punchAxis, WINDUP_LEAN * back);
+      // red telegraph glow (a white hit-flash takes precedence)
+      if (e.flash <= 0) e.obj.traverse((n) => { if (n.isMesh && n.material && n.material.emissive) n.material.emissive.setHex(0x881111); });
+    }
     if (e.windup <= 0) {
-      // slam lands
-      burst(pos, 0xff2a55, 14, 3);
-      if (dist2d(pos, player.pos) < 2.6 && player.invuln <= 0) hurtPlayer(e.def.dmg, pos);
-      sfx.slam();
-      G.shake = Math.max(G.shake, 0.3);
-      startPunch(e, new THREE.Vector3().subVectors(player.pos, pos));
+      if (e.flash <= 0) unflashEnemy(e); // restore the telegraph glow
+      if (e.type === 'brute') {
+        // slam lands (unchanged)
+        burst(pos, 0xff2a55, 14, 3);
+        if (dist2d(pos, player.pos) < 2.6 && player.invuln <= 0) hurtPlayer(e.def.dmg, pos);
+        sfx.slam();
+        G.shake = Math.max(G.shake, 0.3);
+        e.attackCd = BRUTE_CD; // keeps the 2.15 s slam interval (see R2 note)
+        startPunch(e, new THREE.Vector3().subVectors(player.pos, pos));
+      } else {
+        // stalker strike lands at the lunge: damage only if the victim is
+        // still in reach — the telegraph is dodgeable, like the brute slam.
+        if (dist2d(pos, player.pos) < e.radius + player.radius + 0.6 && player.invuln <= 0) hurtPlayer(e.def.dmg, pos);
+        e.attackCd = STALKER_CD; // keeps the 1.45 s strike interval (see R2 note)
+        startPunch(e, new THREE.Vector3().subVectors(player.pos, pos));
+      }
     }
     playClip(e, 'Idle');
     return;
@@ -690,16 +749,21 @@ function updateEnemy(e, dt) {
     if (dPlayer < e.radius + player.radius + 0.25) {
       objFace(e.obj, toPlayer);
       e.attackCd -= dt;
-      if (e.attackCd <= 0) {
-        e.attackCd = 1.1;
-        if (e.type === 'brute') {
-          e.windup = 0.7; // telegraphed heavy slam
+      if (e.type === 'brute') {
+        if (e.attackCd <= 0 && e.windup <= 0) {
+          // attackCd is re-armed at the slam landing (BRUTE_CD), not here:
+          // it stays ~0 through the windup + punch, which both freeze it.
+          e.windup = 0.7; // telegraphed heavy slam (unchanged)
           showTelegraph(pos, 2.6, 0.7);
           sfx.warn();
-        } else {
-          hurtPlayer(e.def.dmg, pos);
-          startPunch(e, toPlayer);
         }
+      } else if (e.attackCd <= STALKER_WINDUP && e.windup <= 0 && e.punchT <= 0) {
+        // R2: the strike is telegraphed for the last 0.28 s of the attack
+        // cycle, so damage still lands exactly one 1.1 s cycle after the
+        // previous strike; the windup handler above lands it at the lunge.
+        e.windup = STALKER_WINDUP;
+        showTelegraph(pos, 1.8, STALKER_WINDUP);
+        sfx.warn();
       }
       playClip(e, 'Idle');
       return;
@@ -770,6 +834,18 @@ function updateBoss(e, dt, slow) {
   }
   if (e.chargeState === 'windup') {
     e.chargeT -= dt;
+    // R2: rear back before the rush — step back + backward lean, growing
+    // through the 0.6 s windup (visual only; rush timing unchanged).
+    const wk = 1 - Math.max(0, e.chargeT) / 0.6;
+    const back = Math.sin(wk * Math.PI * 0.5);
+    if (e.chargeDir.lengthSq() > 0.001) {
+      e.punchOff.copy(e.chargeDir).multiplyScalar(-0.6 * back);
+      pos.add(e.punchOff);
+      // absolute lean (rotation.set resets the tilt every frame — see R2 note)
+      e.obj.rotation.set(0, Math.atan2(e.chargeDir.x, e.chargeDir.z), 0);
+      _punchAxis.set(-e.chargeDir.z, 0, e.chargeDir.x);
+      e.obj.rotateOnWorldAxis(_punchAxis, WINDUP_LEAN * back);
+    }
     if (e.chargeT <= 0) { e.chargeState = 'rush'; e.chargeT = 0.7; sfx.bossMotif(1); }
     playClip(e, 'Idle');
     return;
@@ -785,11 +861,26 @@ function updateBoss(e, dt, slow) {
   }
   if (e.windup > 0) { // slam windup
     e.windup -= dt;
+    // R2: rear back before the slam — step back + backward lean, growing
+    // through the 1.0 s windup; the slam itself now lunges forward too.
+    const wk = 1 - Math.max(0, e.windup) / 1.0;
+    const back = Math.sin(wk * Math.PI * 0.5);
+    if (toPlayer.lengthSq() > 0.001) {
+      const dir = toPlayer.clone().normalize();
+      e.punchOff.copy(dir).multiplyScalar(-0.6 * back);
+      pos.add(e.punchOff);
+      // absolute lean (rotation.set resets the tilt every frame — see R2 note)
+      e.obj.rotation.set(0, Math.atan2(dir.x, dir.z), 0);
+      _punchAxis.set(-dir.z, 0, dir.x);
+      e.obj.rotateOnWorldAxis(_punchAxis, WINDUP_LEAN * back);
+    }
     if (e.windup <= 0) {
       burst(pos, 0xff5a00, 40, 6);
       sfx.slam();
       G.shake = 1.0;
       if (dist2d(pos, player.pos) < 4.6 && player.invuln <= 0) hurtPlayer(e.def.dmg, pos);
+      e.attackCd = BOSS_SLAM_CD; // keeps the 4.20 s slam interval (see R2 note)
+      startPunch(e, toPlayer.clone());
       if (dTower < 5.2) { G.core -= 1; showDmgNum(new THREE.Vector3(0, 3.4, 0), 'CORE -1', 'hurt', 26); showCoreFlash(G.core === 1 ? '⚠ CORE -1 — LAST CHARGE!' : 'CORE -1', G.core === 1); sfx.warn(); updateHUD(); if (G.core <= 0) { loseGame('The Furnace Maw shattered the prism core.'); return; } }
     }
     playClip(e, 'Idle');
@@ -798,7 +889,8 @@ function updateBoss(e, dt, slow) {
   e.attackCd -= dt;
   if (e.attackCd <= 0) {
     if (dPlayer < 4.2 || dTower < 4.6) {
-      e.attackCd = 3.2;
+      // attackCd is re-armed at the slam landing (BOSS_SLAM_CD), not here:
+      // it stays frozen through the windup + punch, which both freeze it.
       e.windup = 1.0;
       showTelegraph(pos, 4.6, 1.0);
       sfx.bossMotif(0);
@@ -832,8 +924,9 @@ function hurtPlayer(dmg, fromPos) {
   if (player.invuln > 0 || G.state !== 'playing') return;
   player.hp -= dmg;
   player.invuln = 0.7;
-  // hit reaction (user feedback): crouch + stagger away from the hit, 0.3 s
-  player.flinchT = 0.3;
+  // hit reaction (user feedback): deep crouch + stagger away from the hit,
+  // 0.45 s (R2: was 0.3 s, too subtle from the high camera)
+  player.flinchT = FLINCH_DUR;
   player.flinchDir.copy(player.pos).sub(fromPos).setY(0);
   if (player.flinchDir.lengthSq() < 0.001) player.flinchDir.set(0, 0, 1);
   else player.flinchDir.normalize();
@@ -896,19 +989,27 @@ function updatePlayer(dt) {
     // keep the flinch fully visible: blink only once the crouch is over
     player.obj.visible = player.flinchT > 0 ? true : (Math.floor(G.time * 14) % 2 === 0);
   } else if (player.obj) player.obj.visible = true;
-  // flinch: crouch down + hunch forward + stagger back, out and back over 0.3 s.
-  // Applied after obj.position.copy(player.pos) above, so it is purely visual
-  // and is overwritten by the next frame's copy.
+  // flinch: deep crouch + backward recoil + stagger back + squash, out and
+  // back over FLINCH_DUR. Applied after obj.position.copy(player.pos) above,
+  // so it is purely visual and is overwritten by the next frame's copy.
+  // The lean stays positive: the top tilts AWAY from the aim, i.e. away from
+  // the attacker — a recoil, not a bow. The squash (shorter + wider) is what
+  // reads from the high camera, where a vertical drop alone is foreshortened.
   if (player.flinchT > 0 && player.obj) {
     player.flinchT -= dt;
-    const k = 1 - Math.max(0, player.flinchT) / 0.3;
+    const k = 1 - Math.max(0, player.flinchT) / FLINCH_DUR;
     const ext = Math.sin(k * Math.PI);
-    player.obj.position.y -= 0.45 * ext;
-    player.obj.position.addScaledVector(player.flinchDir, 0.35 * ext);
+    player.obj.position.y -= FLINCH_DROP * ext;
+    player.obj.position.addScaledVector(player.flinchDir, FLINCH_STAGGER * ext);
     const yaw = Math.atan2(player.aim.x, player.aim.z);
     player.obj.rotation.set(0, yaw, 0);
     _flinchAxis.set(-player.aim.z, 0, player.aim.x);
-    player.obj.rotateOnWorldAxis(_flinchAxis, 0.45 * ext);
+    player.obj.rotateOnWorldAxis(_flinchAxis, FLINCH_LEAN * ext);
+    const bs = player.baseScale;
+    player.obj.scale.set(bs.x * (1 + 0.10 * ext), bs.y * (1 - 0.18 * ext), bs.z * (1 + 0.10 * ext));
+  } else if (player.obj) {
+    // restore the model's base scale (normalizeModel set it, not 1)
+    player.obj.scale.copy(player.baseScale);
   }
   // dash
   if (keys['Space'] && player.dashCd <= 0 && player.dashTime <= 0) {
@@ -1344,6 +1445,7 @@ async function init() {
     player.mixer = hero.mixer;
     player.clips = hero.clips;
     player.current = null;
+    player.baseScale.copy(player.obj.scale); // flinch squash is relative to this
     player.obj.position.copy(player.pos);
     scene.add(player.obj);
     blobShadow(player.obj, 0.9);
