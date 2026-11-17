@@ -495,9 +495,32 @@ function showDmgNum(worldPos, text, cls = '', size = 20) {
 // Flinch: 0.30 -> 0.45 s, drop 0.45 -> 0.8 u, stagger 0.35 -> 0.7 u, plus a
 // squash (shorter + wider) — the squash is what reads from the high camera,
 // where a vertical drop alone is foreshortened away.
-const PUNCH_DUR = 0.55, PUNCH_LUNGE = 1.3, PUNCH_LEAN = 0.5;
-const STALKER_WINDUP = 0.28, WINDUP_LEAN = 0.35, WINDUP_BACK = 0.4;
-const STALKER_CD = 0.9, BRUTE_CD = 0.9, BOSS_SLAM_CD = 2.65; // see above
+// R3 (user feedback): the windup -> lunge order still read as one blur, so
+// the windup is now a 3-beat phrase — REAR BACK, FREEZE, LUNGE. Stalker
+// windup 0.28 -> 0.40 s, step-back 0.4 -> 0.7 u, lean-back 0.35 -> 0.5 rad,
+// then a 0.10 s HOLD frozen at the peak (full step-back + lean + red glow +
+// ring), then a snappier lunge: same 1.3 u offset but 0.55 -> 0.40 s, so the
+// slow rear-back contrasts with the fast strike. Brute/boss keep their
+// windup lengths and get the same treatment proportionally (bigger
+// step-back/lean + 0.10 s hold). Cadence is preserved by the same R2
+// compensation — cycle = punch + countdown + hold (+ windup where the
+// countdown runs to zero first): stalker 0.40 + 0.95 + 0.10 = 1.45 s,
+// brute 0.40 + 0.95 + 0.70 + 0.10 = 2.15 s, boss slam
+// 0.40 + 2.70 + 1.00 + 0.10 = 4.20 s, boss charge sequence
+// 0.60 + 0.10 + 0.70 + 1.00 + 3.90 = 6.30 s (post-charge countdown 4.0 ->
+// 3.9). Telegraph rings now span windup + hold at 0.95 opacity (was 0.7),
+// with a sqrt fade so the ring is still ~0.4 opaque at the peak instead of
+// nearly invisible; the stalker ring is 1.8 -> 2.1 u (brute/boss rings keep
+// radius so the ring never overstates the hit). One subtlety the bigger
+// step-back exposed: the landing reach is judged from the TRUE position
+// (before the frame's pose), because the rear-back is a pose, not a
+// teleport — judging from the visual pos made max-range strikes whiff.
+const PUNCH_DUR = 0.40, PUNCH_LUNGE = 1.3, PUNCH_LEAN = 0.5;
+const STALKER_WINDUP = 0.40, STALKER_HOLD = 0.10, STALKER_BACK = 0.7, STALKER_LEAN = 0.5;
+const BRUTE_WINDUP = 0.7, BRUTE_HOLD = 0.10, BRUTE_BACK = 0.8, BRUTE_LEAN = 0.55;
+const BOSS_WINDUP = 1.0, BOSS_HOLD = 0.10, BOSS_BACK = 0.9, BOSS_LEAN = 0.6;
+const BOSS_CHARGE_WINDUP = 0.6, BOSS_CHARGE_HOLD = 0.10, BOSS_CHARGE_BACK = 0.9, BOSS_CHARGE_LEAN = 0.6;
+const STALKER_CD = 0.95, BRUTE_CD = 0.95, BOSS_SLAM_CD = 2.70, BOSS_CHARGE_CD = 3.9; // see above
 const FLINCH_DUR = 0.45, FLINCH_DROP = 0.8, FLINCH_STAGGER = 0.7, FLINCH_LEAN = 0.75;
 const _v = new THREE.Vector3();
 const _punchAxis = new THREE.Vector3();
@@ -549,6 +572,22 @@ function flashEnemy(e) {
 function unflashEnemy(e) {
   e.obj.traverse((n) => { if (n.isMesh && n.material && n.material.emissive) n.material.emissive.setHex(e.baseEmissive); });
 }
+// R3: shared windup/hold pose — step back + backward lean + red glow, all
+// absolute (rotation.set resets the tilt every frame, like the punch).
+// dir is the normalized direction toward the victim; back/lean are the FULL
+// peak values, and k (0..1) eases into them over the windup ramp (k = 1 is
+// the frozen hold at the peak).
+function windupPose(e, dir, back, lean, k) {
+  const pos = e.obj.position;
+  e.punchOff.copy(dir).multiplyScalar(-back * k);
+  pos.add(e.punchOff);
+  e.obj.rotation.set(0, Math.atan2(dir.x, dir.z), 0);
+  _punchAxis.set(-dir.z, 0, dir.x);
+  // positive angle = lean back, away from the victim
+  e.obj.rotateOnWorldAxis(_punchAxis, lean * k);
+  // red telegraph glow (a white hit-flash takes precedence)
+  if (e.flash <= 0) e.obj.traverse((n) => { if (n.isMesh && n.material && n.material.emissive) n.material.emissive.setHex(0x881111); });
+}
 
 // ---------- enemies ----------
 function spawnEnemy(type, riftIdx) {
@@ -566,7 +605,7 @@ function spawnEnemy(type, riftIdx) {
     type, def, obj, mixer: ch.mixer, clips: ch.clips, current: null,
     hp: def.hp, speed: def.speed, radius: def.radius,
     targetTower: type !== 'shooter' && (type === 'brute' || rand() < 0.55),
-    attackCd: 1 + rand(), shootCd: 1.5 + rand(), windup: 0, flash: 0, baseEmissive: 0,
+    attackCd: 1 + rand(), shootCd: 1.5 + rand(), windup: 0, holdT: 0, flash: 0, baseEmissive: 0,
     lit: false, dead: false, chargeState: null, chargeDir: new THREE.Vector3(), chargeT: 0, stun: 0,
     hitCd: 0,
     // B04 emergency unstick (tower-targeters): stuckT accumulates while the
@@ -673,42 +712,65 @@ function updateEnemy(e, dt) {
   if (e.type === 'boss') { updateBoss(e, dt, slow); return; }
   // telegraph windup before a melee strike lands (brute slam / stalker
   // strike): the enemy rears BACK away from the victim — step back + backward
-  // lean + red glow + ground ring — growing through the windup, then the
-  // strike lunges forward. Damage still lands at the lunge, on the same
-  // attack cycle as before (see the in-range branch below).
+  // lean + red glow + ground ring — growing through the windup, then FREEZES
+  // at the peak for HOLD, then the strike lunges forward. Damage still lands
+  // at the end of the hold, on the same attack cycle as before (see the
+  // in-range branch below and the R3 note above the constants).
   if (e.windup > 0) {
     e.windup -= dt;
-    const wMax = e.type === 'brute' ? 0.7 : STALKER_WINDUP;
+    const brute = e.type === 'brute';
+    const wMax = brute ? BRUTE_WINDUP : STALKER_WINDUP;
     const wk = 1 - Math.max(0, e.windup) / wMax; // 0 -> 1 over the windup
     const back = Math.sin(wk * Math.PI * 0.5);
     const toP = new THREE.Vector3().subVectors(player.pos, pos).setY(0);
     if (toP.lengthSq() > 0.001) {
       toP.normalize();
-      e.punchOff.copy(toP).multiplyScalar(-WINDUP_BACK * back);
-      pos.add(e.punchOff);
-      // absolute lean (rotation.set resets the tilt every frame — see above)
-      e.obj.rotation.set(0, Math.atan2(toP.x, toP.z), 0);
-      _punchAxis.set(-toP.z, 0, toP.x);
-      // positive angle = lean back, away from the victim
-      e.obj.rotateOnWorldAxis(_punchAxis, WINDUP_LEAN * back);
-      // red telegraph glow (a white hit-flash takes precedence)
-      if (e.flash <= 0) e.obj.traverse((n) => { if (n.isMesh && n.material && n.material.emissive) n.material.emissive.setHex(0x881111); });
+      windupPose(e, toP, brute ? BRUTE_BACK : STALKER_BACK, brute ? BRUTE_LEAN : STALKER_LEAN, back);
     }
     if (e.windup <= 0) {
+      // R3: freeze at the peak for HOLD before the lunge, so the eye can
+      // register "wound up" before the strike. The glow stays on through
+      // the hold; the hold branch below lands the strike.
+      e.holdT = brute ? BRUTE_HOLD : STALKER_HOLD;
+    }
+    playClip(e, 'Idle');
+    return;
+  }
+  // R3 hold: frozen at peak windup (full step-back + lean + red glow + ring)
+  if (e.holdT > 0) {
+    e.holdT -= dt;
+    const brute = e.type === 'brute';
+    // R3: judge the hit from the TRUE distance, captured BEFORE this frame's
+    // pose is applied — pos still holds the true position here (the visual
+    // step-back is stripped at the top of updateEnemy). The rear-back is a
+    // pose, not a teleport: with the 0.7 u step-back the visual position
+    // sits 2.1 u out at the staged 1.4 u range, outside the 2.05 u reach,
+    // so judging from the visual pos made the strike whiff forever
+    // (probe-r3-diag: 4+ clean windup -> hold -> lunge cycles, hp never
+    // dropped). The trigger still requires true range at windup start, and
+    // the player can still dodge by moving away during the 0.5 s telegraph.
+    const dTrue = dist2d(pos, player.pos);
+    const toP = new THREE.Vector3().subVectors(player.pos, pos).setY(0);
+    if (toP.lengthSq() > 0.001) {
+      toP.normalize();
+      windupPose(e, toP, brute ? BRUTE_BACK : STALKER_BACK, brute ? BRUTE_LEAN : STALKER_LEAN, 1);
+    }
+    if (e.holdT <= 0) {
       if (e.flash <= 0) unflashEnemy(e); // restore the telegraph glow
-      if (e.type === 'brute') {
+      if (brute) {
         // slam lands (unchanged)
         burst(pos, 0xff2a55, 14, 3);
-        if (dist2d(pos, player.pos) < 2.6 && player.invuln <= 0) hurtPlayer(e.def.dmg, pos);
+        if (dTrue < 2.6 && player.invuln <= 0) hurtPlayer(e.def.dmg, pos);
         sfx.slam();
         G.shake = Math.max(G.shake, 0.3);
-        e.attackCd = BRUTE_CD; // keeps the 2.15 s slam interval (see R2 note)
+        e.attackCd = BRUTE_CD; // keeps the 2.15 s slam interval (see R3 note)
         startPunch(e, new THREE.Vector3().subVectors(player.pos, pos));
       } else {
         // stalker strike lands at the lunge: damage only if the victim is
         // still in reach — the telegraph is dodgeable, like the brute slam.
-        if (dist2d(pos, player.pos) < e.radius + player.radius + 0.6 && player.invuln <= 0) hurtPlayer(e.def.dmg, pos);
-        e.attackCd = STALKER_CD; // keeps the 1.45 s strike interval (see R2 note)
+        // Reach is judged from dTrue (see above), not the backed-up visual pos.
+        if (dTrue < e.radius + player.radius + 0.6 && player.invuln <= 0) hurtPlayer(e.def.dmg, pos);
+        e.attackCd = STALKER_CD; // keeps the 1.45 s strike interval (see R3 note)
         startPunch(e, new THREE.Vector3().subVectors(player.pos, pos));
       }
     }
@@ -752,17 +814,18 @@ function updateEnemy(e, dt) {
       if (e.type === 'brute') {
         if (e.attackCd <= 0 && e.windup <= 0) {
           // attackCd is re-armed at the slam landing (BRUTE_CD), not here:
-          // it stays ~0 through the windup + punch, which both freeze it.
-          e.windup = 0.7; // telegraphed heavy slam (unchanged)
-          showTelegraph(pos, 2.6, 0.7);
+          // it stays ~0 through the windup + hold + punch, which all freeze it.
+          e.windup = BRUTE_WINDUP; // telegraphed heavy slam (unchanged)
+          showTelegraph(pos, 2.6, BRUTE_WINDUP + BRUTE_HOLD, 0.95);
           sfx.warn();
         }
       } else if (e.attackCd <= STALKER_WINDUP && e.windup <= 0 && e.punchT <= 0) {
-        // R2: the strike is telegraphed for the last 0.28 s of the attack
-        // cycle, so damage still lands exactly one 1.1 s cycle after the
-        // previous strike; the windup handler above lands it at the lunge.
+        // R3: the strike is telegraphed for the last 0.40 s of the attack
+        // cycle + 0.10 s hold, so damage still lands exactly one 1.45 s
+        // cycle after the previous strike; the hold handler above lands it
+        // at the lunge.
         e.windup = STALKER_WINDUP;
-        showTelegraph(pos, 1.8, STALKER_WINDUP);
+        showTelegraph(pos, 2.1, STALKER_WINDUP + STALKER_HOLD, 0.95);
         sfx.warn();
       }
       playClip(e, 'Idle');
@@ -798,21 +861,25 @@ function objFace(obj, dir) {
 // red telegraph ring on the ground (grows, then fades)
 const teleGeo = new THREE.RingGeometry(0.85, 1, 32);
 const teleMat = new THREE.MeshBasicMaterial({ color: 0xff2a33, transparent: true, opacity: 0.7, side: THREE.DoubleSide, depthWrite: false });
-function showTelegraph(pos, radius, dur) {
+function showTelegraph(pos, radius, dur, op = 0.7) {
   const m = new THREE.Mesh(teleGeo, teleMat.clone());
   m.rotation.x = -Math.PI / 2;
   m.position.set(pos.x, 0.06, pos.z);
   m.scale.setScalar(radius);
+  m.material.opacity = op;
   scene.add(m);
   G.telegraphs = G.telegraphs || [];
-  G.telegraphs.push({ mesh: m, life: dur, max: dur });
+  G.telegraphs.push({ mesh: m, life: dur, max: dur, op });
 }
 function updateTelegraphs(dt) {
   if (!G.telegraphs) return;
   for (let i = G.telegraphs.length - 1; i >= 0; i--) {
     const t = G.telegraphs[i];
     t.life -= dt;
-    t.mesh.material.opacity = 0.7 * Math.max(0, t.life / t.max);
+    // R3: sqrt fade — the ring stays clearly visible through the windup peak
+    // and the hold (linear fade had it nearly invisible, ~0.19, exactly when
+    // the player most needs the warning), then drops fast into the lunge.
+    t.mesh.material.opacity = (t.op ?? 0.7) * Math.sqrt(Math.max(0, t.life / t.max));
     if (t.life <= 0) { scene.remove(t.mesh); t.mesh.material.dispose(); G.telegraphs.splice(i, 1); }
   }
 }
@@ -834,17 +901,22 @@ function updateBoss(e, dt, slow) {
   }
   if (e.chargeState === 'windup') {
     e.chargeT -= dt;
-    // R2: rear back before the rush — step back + backward lean, growing
-    // through the 0.6 s windup (visual only; rush timing unchanged).
-    const wk = 1 - Math.max(0, e.chargeT) / 0.6;
+    // R3: rear back before the rush — step back + backward lean, growing
+    // through the 0.6 s windup, then a 0.10 s freeze at the peak (hold).
+    const wk = 1 - Math.max(0, e.chargeT) / BOSS_CHARGE_WINDUP;
     const back = Math.sin(wk * Math.PI * 0.5);
     if (e.chargeDir.lengthSq() > 0.001) {
-      e.punchOff.copy(e.chargeDir).multiplyScalar(-0.6 * back);
-      pos.add(e.punchOff);
-      // absolute lean (rotation.set resets the tilt every frame — see R2 note)
-      e.obj.rotation.set(0, Math.atan2(e.chargeDir.x, e.chargeDir.z), 0);
-      _punchAxis.set(-e.chargeDir.z, 0, e.chargeDir.x);
-      e.obj.rotateOnWorldAxis(_punchAxis, WINDUP_LEAN * back);
+      windupPose(e, e.chargeDir, BOSS_CHARGE_BACK, BOSS_CHARGE_LEAN, back);
+    }
+    if (e.chargeT <= 0) { e.chargeState = 'hold'; e.chargeT = BOSS_CHARGE_HOLD; }
+    playClip(e, 'Idle');
+    return;
+  }
+  if (e.chargeState === 'hold') {
+    e.chargeT -= dt;
+    // R3: frozen at peak windup — the rush is visibly "loaded" before it fires.
+    if (e.chargeDir.lengthSq() > 0.001) {
+      windupPose(e, e.chargeDir, BOSS_CHARGE_BACK, BOSS_CHARGE_LEAN, 1);
     }
     if (e.chargeT <= 0) { e.chargeState = 'rush'; e.chargeT = 0.7; sfx.bossMotif(1); }
     playClip(e, 'Idle');
@@ -859,29 +931,46 @@ function updateBoss(e, dt, slow) {
     playClip(e, 'Run');
     return;
   }
-  if (e.windup > 0) { // slam windup
-    e.windup -= dt;
-    // R2: rear back before the slam — step back + backward lean, growing
-    // through the 1.0 s windup; the slam itself now lunges forward too.
-    const wk = 1 - Math.max(0, e.windup) / 1.0;
-    const back = Math.sin(wk * Math.PI * 0.5);
-    if (toPlayer.lengthSq() > 0.001) {
-      const dir = toPlayer.clone().normalize();
-      e.punchOff.copy(dir).multiplyScalar(-0.6 * back);
-      pos.add(e.punchOff);
-      // absolute lean (rotation.set resets the tilt every frame — see R2 note)
-      e.obj.rotation.set(0, Math.atan2(dir.x, dir.z), 0);
-      _punchAxis.set(-dir.z, 0, dir.x);
-      e.obj.rotateOnWorldAxis(_punchAxis, WINDUP_LEAN * back);
+  // R3 hold: frozen at peak slam windup before the slam lands.
+  if (e.holdT > 0) {
+    e.holdT -= dt;
+    // R3: judge the hit from the TRUE distance, captured BEFORE this frame's
+    // pose is applied (same reason as the stalker/brute hold above: the
+    // 0.9 u step-back would otherwise push the visual pos past the 4.6 u
+    // slam reach whenever the slam triggered near max range).
+    const dTrue = dist2d(pos, player.pos);
+    const dir = new THREE.Vector3().subVectors(player.pos, pos).setY(0);
+    if (dir.lengthSq() > 0.001) {
+      dir.normalize();
+      windupPose(e, dir, BOSS_BACK, BOSS_LEAN, 1);
     }
-    if (e.windup <= 0) {
+    if (e.holdT <= 0) {
+      if (e.flash <= 0) unflashEnemy(e); // clear the telegraph glow
       burst(pos, 0xff5a00, 40, 6);
       sfx.slam();
       G.shake = 1.0;
-      if (dist2d(pos, player.pos) < 4.6 && player.invuln <= 0) hurtPlayer(e.def.dmg, pos);
-      e.attackCd = BOSS_SLAM_CD; // keeps the 4.20 s slam interval (see R2 note)
+      if (dTrue < 4.6 && player.invuln <= 0) hurtPlayer(e.def.dmg, pos);
+      e.attackCd = BOSS_SLAM_CD; // keeps the 4.20 s slam interval (see R3 note)
       startPunch(e, toPlayer.clone());
       if (dTower < 5.2) { G.core -= 1; showDmgNum(new THREE.Vector3(0, 3.4, 0), 'CORE -1', 'hurt', 26); showCoreFlash(G.core === 1 ? '⚠ CORE -1 — LAST CHARGE!' : 'CORE -1', G.core === 1); sfx.warn(); updateHUD(); if (G.core <= 0) { loseGame('The Furnace Maw shattered the prism core.'); return; } }
+    }
+    playClip(e, 'Idle');
+    return;
+  }
+  if (e.windup > 0) { // slam windup
+    e.windup -= dt;
+    // R3: rear back before the slam — step back + backward lean, growing
+    // through the 1.0 s windup, then a 0.10 s freeze at the peak (hold);
+    // the slam itself now lunges forward too.
+    const wk = 1 - Math.max(0, e.windup) / BOSS_WINDUP;
+    const back = Math.sin(wk * Math.PI * 0.5);
+    if (toPlayer.lengthSq() > 0.001) {
+      const dir = toPlayer.clone().normalize();
+      windupPose(e, dir, BOSS_BACK, BOSS_LEAN, back);
+    }
+    if (e.windup <= 0) {
+      // R3: freeze at the peak before the slam (see the hold branch above).
+      e.holdT = BOSS_HOLD;
     }
     playClip(e, 'Idle');
     return;
@@ -890,18 +979,20 @@ function updateBoss(e, dt, slow) {
   if (e.attackCd <= 0) {
     if (dPlayer < 4.2 || dTower < 4.6) {
       // attackCd is re-armed at the slam landing (BOSS_SLAM_CD), not here:
-      // it stays frozen through the windup + punch, which both freeze it.
-      e.windup = 1.0;
-      showTelegraph(pos, 4.6, 1.0);
+      // it stays frozen through the windup + hold + punch, which all freeze it.
+      e.windup = BOSS_WINDUP;
+      showTelegraph(pos, 4.6, BOSS_WINDUP + BOSS_HOLD, 0.95);
       sfx.bossMotif(0);
       playClip(e, 'Idle');
       return;
     }
     if (dPlayer > 6 && dPlayer < 14 && rand() < 0.6) {
-      e.attackCd = 4.0;
-      e.chargeState = 'windup'; e.chargeT = 0.6;
+      // R3: post-charge countdown 4.0 -> 3.9 pays back the 0.10 s charge hold,
+      // so the charge-to-next-attack sequence stays 6.30 s (see R3 note).
+      e.attackCd = BOSS_CHARGE_CD;
+      e.chargeState = 'windup'; e.chargeT = BOSS_CHARGE_WINDUP;
       e.chargeDir.copy(toPlayer.normalize());
-      showTelegraph(pos.clone().addScaledVector(e.chargeDir, 4), 1.2, 0.6);
+      showTelegraph(pos.clone().addScaledVector(e.chargeDir, 4), 1.2, BOSS_CHARGE_WINDUP + BOSS_CHARGE_HOLD, 0.95);
       sfx.bossMotif(2);
       playClip(e, 'Idle');
       return;
@@ -1532,8 +1623,8 @@ async function runShot() {
       for (let i = 0; i < 120; i++) { botInput(); realUpdate(1 / 60); renderer.render(scene, camera); }
       // re-arm the slam telegraph so it is visible in the capture
       if (G.boss && !G.boss.dead) {
-        G.boss.windup = 1.0;
-        showTelegraph(G.boss.obj.position, 4.6, 1.0);
+        G.boss.windup = BOSS_WINDUP;
+        showTelegraph(G.boss.obj.position, 4.6, BOSS_WINDUP + BOSS_HOLD, 0.95);
         G.boss.attackCd = 99;
       }
       botFire = false; // stop shooting: let the boss hit-flash expire for a clean capture
